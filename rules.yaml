@@ -1,0 +1,20 @@
+default_tag: other
+rules:
+- process: editor.exe
+  tag: coding
+- process: terminal.exe
+  tag: coding
+- process: python.exe
+  tag: coding
+- process: pythonw.exe
+  tag: coding
+- process: browser.exe
+  tag: browsing
+- process: chat-client.exe
+  tag: chat
+- process: game.exe
+  tag: gaming
+- process: game-launcher.exe
+  tag: gaming
+- process: file-manager.exe
+  tag: other

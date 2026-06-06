@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+data/
+*.jsonl
+*_summary*.md
+agent_error.log
