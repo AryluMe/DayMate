@@ -126,6 +126,7 @@ rules:
 - 数据存在 `~/.daymate/data/`
 - **不记录任何键盘敲击的文本内容**，只统计次数
 - 如果还是不放心，`--summary-redacted` 是你的好朋友
+- 上传或分享仓库前，先看 [`docs/GITHUB_UPLOAD_FILTER.md`](docs/GITHUB_UPLOAD_FILTER.md)
 
 ## 🤔 为什么叫 DayMate？
 
@@ -218,6 +219,8 @@ python daymate.py --summary-redacted today  # safe for screenshots
 - **Local only.** Zero network calls.
 - Data stored in `~/.daymate/data/`
 - **No keystroke text is ever recorded** — just counts
+- Use `--summary-redacted` for public screenshots that mask app names
+- See [`docs/GITHUB_UPLOAD_FILTER.md`](docs/GITHUB_UPLOAD_FILTER.md) before pushing or sharing repository contents.
 
 ## License
 

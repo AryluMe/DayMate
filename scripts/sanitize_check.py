@@ -35,9 +35,15 @@ PRIVATE_PROCESS_NAME_PARTS = {
 }
 
 BLOCKED_FILE_PATTERNS = [
+    re.compile(r"(^|.*/)\.daymate/.*", re.IGNORECASE),
+    re.compile(r"(^|.*/)data/.*", re.IGNORECASE),
+    re.compile(r".*\.env(\..*)?$", re.IGNORECASE),
     re.compile(r".*\.pyc$", re.IGNORECASE),
     re.compile(r".*\.jsonl$", re.IGNORECASE),
     re.compile(r".*_summary.*\.md$", re.IGNORECASE),
+    re.compile(r".*\.log$", re.IGNORECASE),
+    re.compile(r".*\.(db|sqlite|sqlite3)$", re.IGNORECASE),
+    re.compile(r".*\.(pem|key|p12|pfx)$", re.IGNORECASE),
     re.compile(r".*watchdog.*\.vbs$", re.IGNORECASE),
 ]
 
@@ -91,6 +97,7 @@ def scan_path(root: Path, path: Path, patterns: list[re.Pattern[str]]) -> list[F
     for pattern in BLOCKED_FILE_PATTERNS:
         if pattern.fullmatch(rel):
             findings.append(Finding(path, None, "blocked generated/private file"))
+            break
 
     if not is_text_file(path):
         return findings
