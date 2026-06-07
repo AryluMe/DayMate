@@ -1,107 +1,37 @@
+# DayMate
 
-<p align="center">
-  <h1>DayMate 🫂</h1>
-  <p align="center">一个小陪伴，看着你干活、数你敲了多少键、每天给你发一个称号。</p>
-</p>
+DayMate is a tiny Windows-first daily companion tracker. It records foreground
+window segments, keyboard activity counts, rule-based tags, JSONL history, and
+playful Markdown daily summaries.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/OS-Windows-blue?style=flat-square">
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square">
-  <img src="https://img.shields.io/badge/status-whimsical-orange?style=flat-square">
-  <img src="https://img.shields.io/badge/privacy-local_only-ff69b4?style=flat-square">
-</p>
+## Features
 
-<p align="center">
-  <b>中文 · <a href="#english">English</a></b>
-</p>
+- Local-only storage by default
+- Foreground window polling
+- Keyboard count aggregation without storing typed text
+- Rule-based tagging through `rules.yaml`
+- JSONL activity records
+- Markdown daily summaries with playful badges and milestones
+- Redacted summary mode for public screenshots
 
----
-
-不联网。不需要登录。没有什么「我们很重视您的隐私」的套话——它就老老实实待在你自己的电脑上，不和任何人说话。
-
-你可能根本感觉不到它的存在，直到某天晚上它突然冒出一句：
-
-> 🔥 **今日称号：代码炼金术士**
-> ——你今天的产出够团队忙一星期。
-
-你愣了一下。然后觉得……嗯，还挺有意思的。
-
----
-
-## 🏅 它能做什么
-
-### 每天给你发称号
-
-DayMate 看你一整天都在干什么，挑一个合适的称号给你：
-
-| 称号 | 什么情况 |
-|------|---------|
-| 🔥 代码炼金术士 | 你今天的代码量像写了一本小说 |
-| ⚡ 闪电键盘手 | 峰值手速破 80 键/分钟 |
-| 💬 社交恐怖分子 | 一整天都在对话框里度过 |
-| 🎮 电竞复活者 | WASD 几乎占据了你今天的键盘 |
-| 🦥 树懒模式 | 谁都有这么一天…… |
-| 🌅 早鸟 | 大部分人还没醒你已经在干活了 |
-| 🦉 夜行生物 | 凌晨还在战斗 |
-
-### 解锁成就徽章
-
-| 徽章 | 解锁条件 |
-|------|---------|
-| 🎖️ **键盘勇者** | 一天敲了一万次键盘 |
-| 🎖️ **马拉松选手** | 连续专注 2 小时以上不中断 |
-| 🎖️ **编码铁人** | 一天编码超 8 小时 |
-| 🎖️ **零游戏自律日** | 整整一天没打开任何游戏 🤝 |
-| 🎖️ **键盘洁癖** | 删除率不到 3%——你几乎不犯错 |
-| 🎖️ **夜行生物 🌙** | 凌晨还在活跃 |
-| 🎖️ **桌面清道夫** | 均衡发展，什么都做了一点 |
-
-还有更多等你发掘。
-
-### 24 小时热力图
-
-```
-    0   4   8   12  16  20
-   ⬛⬛⬛⬛🟩🟨🟩🟩🟩🟩🟩🟩🟨⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛
-```
-
-绿色代表「心流」，灰色代表「大概在吃饭」，黑色代表「正常人类睡眠时间」。还会自动告诉你，你是 🦉 夜猫子体质还是 🌅 早鸟体质。
-
-### 键盘行为分析
-
-- **WASD 密度** —— 打没打游戏，它心里有数
-- **键速 KPM** —— 你是真的快，还是在乱按？
-- **删除率** —— 精雕细琢型选手，还是先写再说型？
-- **快捷键比例** —— 键盘流高手，还是鼠标右键党？
-
-### 活动时间线
-
-```text
-- 编码          3h 42m  ##################
-- 聊天          1h 15m  ######
-- 游戏          0m      (╯°□°）╯︵ ┻━┻（今天没打）
-- 离开          2h 30m  ############
-```
-
-## 🚀 快速开始
+## Install
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python daymate.py
 ```
 
-就这样。它安安静静地在你后台跑着，像一个从桌角探出脑袋看你的小东西。
-
-查看你的第一份日报：
+## Run
 
 ```powershell
-python daymate.py --summary today
+python daymate.py --rules rules.yaml
 ```
 
-想截个图发朋友圈？
+Generate a daily summary:
 
 ```powershell
-python daymate.py --summary-redacted today
+python daymate.py --summary 2026-01-01
 ```
 
 它会隐藏应用名，避免你不小心让全世界知道你在 ~~微信~~ 上花了多久。
@@ -204,23 +134,44 @@ Green = locked in. Gray = probably eating. Black = sleeping. Night owl or early 
 
 ## 🚀 Quick Start
 
-```powershell
-pip install -r requirements.txt
-python daymate.py
-```
+Generate a redacted summary for public screenshots:
 
 ```powershell
-python daymate.py --summary today
-python daymate.py --summary-redacted today  # safe for screenshots
+python daymate.py --summary-redacted 2026-01-01
 ```
 
-## 🔒 Privacy
+Use a custom data directory:
+
+```powershell
+python daymate.py --data-root "$env:USERPROFILE\.daymate\data"
+```
+
+## Sanitize Before Publishing
 
 - **Local only.** Zero network calls.
 - Data stored in `~/.daymate/data/`
 - **No keystroke text is ever recorded** — just counts
 - Use `--summary-redacted` for public screenshots that mask app names
 - See [`docs/GITHUB_UPLOAD_FILTER.md`](docs/GITHUB_UPLOAD_FILTER.md) before pushing or sharing repository contents.
+
+Run the public-tree leak check:
+
+```powershell
+python scripts/sanitize_check.py .
+```
+
+After creating a Git repository for the public copy, install the pre-push hook:
+
+```powershell
+python scripts/install_pre_push_hook.py .
+```
+
+## Privacy Notes
+
+The tracker stores active window titles, process names, coarse keyboard counts,
+and timestamps. It does not store typed text. Review your generated JSONL and
+summary files before publishing examples or screenshots, and prefer
+`--summary-redacted` for public visuals.
 
 ## License
 

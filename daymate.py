@@ -813,14 +813,14 @@ def log_unhandled_exception(exc: BaseException) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Your daily desktop companion — counts keys, tracks apps, gives you silly titles", epilog="DayMate lives on your machine and talks to no one. No cloud, no login, no telemetry.")
+    parser = argparse.ArgumentParser(description="Local activity tracker MVP")
     parser.add_argument("--install", action="store_true", help="Register a Windows logon startup task")
-    parser.add_argument("--summary", nargs="?", const="", help="See today's title, badges, heatmap & more -- optional YYYY-MM-DD")
+    parser.add_argument("--summary", nargs="?", const="", help="Write and print a daily summary, optional YYYY-MM-DD")
     parser.add_argument(
         "--summary-redacted",
         nargs="?",
         const="",
-        help="Redacted summary for public screenshots (masks app names) -- optional YYYY-MM-DD",
+        help="Write and print a redacted daily summary for public screenshots, optional YYYY-MM-DD",
     )
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES_PATH, help="Path to rules.yaml")
     parser.add_argument("--data-root", type=Path, default=None, help="Override activity data root")
