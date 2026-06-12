@@ -16,5 +16,21 @@ rules:
   tag: gaming
 - process: game-launcher.exe
   tag: gaming
+- process: Overwatch*
+  tag: gaming
+- process: csgo*
+  tag: gaming
+- process: cs2*
+  tag: gaming
+- process: Sultan*
+  tag: gaming
+- process: TOTClient*
+  tag: gaming
+- process: Battle.net*
+  tag: gaming
+- process: Hearthstone*
+  tag: gaming
+- process: TslGame*
+  tag: gaming
 - process: file-manager.exe
   tag: other

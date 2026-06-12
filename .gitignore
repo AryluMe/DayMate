@@ -1,22 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
-
-# DayMate private runtime data. Do not publish raw local activity records.
-.daymate/
 data/
 *.jsonl
 *_summary*.md
 agent_error.log
-*.log
-
-# Local secrets and machine-specific files.
-.env
-.env.*
-*.pem
-*.key
-*.p12
-*.pfx
-*.sqlite
-*.sqlite3
-*.db

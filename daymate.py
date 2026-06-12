@@ -9,17 +9,70 @@ import sys
 import threading
 import time
 import traceback
+import re
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time as day_time, timedelta
+
+import browser_history
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RULES_PATH = SCRIPT_DIR / "rules.yaml"
 TASK_NAME = "DayMateActivityTracker"
+CURRENT_STATE_SCHEMA_VERSION = 2
+CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
+CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "away"]
+
+# ── v2: process-level tracking ──
+TOOL_MAP: dict[str, dict[str, str]] = {
+    "assistant.exe": {"id": "assistant", "label": "Assistant", "category": "coding"},
+    "editor.exe": {"id": "editor", "label": "Editor", "category": "coding"},
+    "terminal.exe": {"id": "terminal", "label": "Terminal", "category": "coding"},
+    "browser.exe": {"id": "browser", "label": "Browser", "category": "browsing"},
+    "chat-client.exe": {"id": "chat", "label": "Chat", "category": "chat"},
+    "game.exe": {"id": "game", "label": "Game", "category": "gaming"},
+    "game-launcher.exe": {"id": "game-launcher", "label": "Game Launcher", "category": "gaming"},
+    "file-manager.exe": {"id": "file-manager", "label": "File Manager", "category": "other"},
+    "python.exe": {"id": "python", "label": "Python", "category": "coding"},
+    "pythonw.exe": {"id": "pythonw", "label": "Python", "category": "coding"},
+}
+TOOL_IDS = {"assistant", "editor", "terminal", "browser", "chat", "game", "game-launcher", "file-manager", "python", "pythonw"}
+
+_TASK_RE = re.compile(r"T(\d{1,3})\s*[-\u2013\u2014]\s*(.+)")
+_TASK_BARE_RE = re.compile(r"\bT(\d{1,3})\b")
+_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s]*")
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def extract_task_hint(title: str) -> str | None:
+    """Extract task hint like 'T33 - 基金' from window title."""
+    m = _TASK_RE.search(title)
+    if m:
+        num = m.group(1)
+        desc = m.group(2).strip()
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+        return f"T{num} - {desc}"
+    m = _TASK_BARE_RE.search(title)
+    if m:
+        return f"T{m.group(1)}"
+    return None
+
+
+def sanitize_title(title: str) -> str:
+    """Sanitize window title: remove paths, UUIDs, and truncate."""
+    if not title:
+        return ""
+    t = _PATH_RE.sub("", title)
+    t = _UUID_RE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) > 100:
+        t = t[:97] + "..."
+    return t
 
 
 def now_local() -> datetime:
@@ -219,6 +272,16 @@ class RuleEngine:
             tags = [str(tag)]
         return tags or [self.default_tag]
 
+    def known_tags(self) -> set[str]:
+        tags = {self.default_tag, "away"}
+        for rule in self.rules:
+            raw_tag = rule.get("tag") or self.default_tag
+            if isinstance(raw_tag, list):
+                tags.update(str(item) for item in raw_tag if item)
+            elif raw_tag:
+                tags.add(str(raw_tag))
+        return tags
+
     @staticmethod
     def _specificity_score(pattern: str, title_contains: Any) -> int:
         wildcard_count = pattern.count("*") + pattern.count("?")
@@ -269,6 +332,17 @@ class ActivityStorage:
         return segments
 
 
+def append_exception_log(log_path: Path, exc: BaseException) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{now_local().isoformat(timespec='seconds')}]\n")
+            handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            handle.write("\n")
+    except Exception:
+        pass
+
+
 def get_active_window() -> WindowInfo:
     if os.name != "nt":
         raise RuntimeError("Window polling is only supported on Windows.")
@@ -312,6 +386,17 @@ def get_active_window() -> WindowInfo:
             except Exception:
                 pass
 
+    if process_name.startswith("pid-"):
+        try:
+            import psutil
+            proc = psutil.Process(pid)
+            resolved = proc.name() or ""
+            if resolved:
+                process_name = resolved
+                exe_path = proc.exe() or exe_path
+        except Exception:
+            pass
+
     return WindowInfo(title=title, process_name=process_name, exe_path=exe_path)
 
 
@@ -334,6 +419,11 @@ class ActivityTracker:
         self.away_threshold = timedelta(minutes=max(0.1, float(away_minutes)))
         self.keyboard_counter = KeyboardCounter(keyboard)
         self._stop_event = threading.Event()
+        # v2: process-level tracking state
+        self._tool_sessions: dict[str, set[int]] = {}
+        self._tool_wall_ceiling: dict[str, float] = self._load_tool_wall(date.today())
+        self._peak_concurrency = 0
+        self._peak_concurrency_at: str | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -344,15 +434,31 @@ class ActivityTracker:
         current = self._start_segment(active_window, now_local())
         last_seen_window_key = active_window.key()
         last_activity_ts = now_local()
+        state_keyboard_snapshot = self.keyboard_counter.snapshot()
+        state_sample_ts = now_local()
+        last_state_write_ts: datetime | None = None
+        state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
+            current,
+            state_sample_ts,
+            state_keyboard_snapshot,
+            state_sample_ts,
+        )
+        last_state_write_ts = state_sample_ts
 
         try:
             while not self._stop_event.wait(self.poll_interval):
                 now = now_local()
+                state_changed = False
 
                 if current.start_ts.date() != now.date():
                     boundary = datetime.combine(now.date(), day_time.min)
                     self._finish_segment(current, boundary)
                     current = self._start_segment(current.window, boundary, is_away=current.is_away)
+                    state_changed = True
+                    # v2: reset tool tracking for new day
+                    self._tool_sessions.clear()
+                    self._peak_concurrency = 0
+                    self._peak_concurrency_at = None
 
                 active_window = get_active_window()
                 active_key = active_window.key()
@@ -370,6 +476,15 @@ class ActivityTracker:
                     if window_changed or key_activity:
                         self._finish_segment(current, now, keyboard_stats=empty_keyboard_stats())
                         current = self._start_segment(active_window, now)
+                        state_changed = True
+                    if state_changed or self._current_state_heartbeat_due(now, last_state_write_ts):
+                        state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
+                            current,
+                            now,
+                            state_keyboard_snapshot,
+                            state_sample_ts,
+                        )
+                        last_state_write_ts = state_sample_ts
                     continue
 
                 if now - last_activity_ts >= self.away_threshold:
@@ -378,11 +493,28 @@ class ActivityTracker:
                         away_start = now
                     self._finish_segment(current, away_start)
                     current = self._start_segment(self._away_window(), away_start, is_away=True)
+                    state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
+                        current,
+                        now,
+                        state_keyboard_snapshot,
+                        state_sample_ts,
+                    )
+                    last_state_write_ts = state_sample_ts
                     continue
 
                 if window_changed:
                     self._finish_segment(current, now)
                     current = self._start_segment(active_window, now)
+                    state_changed = True
+
+                if state_changed or self._current_state_heartbeat_due(now, last_state_write_ts):
+                    state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
+                        current,
+                        now,
+                        state_keyboard_snapshot,
+                        state_sample_ts,
+                    )
+                    last_state_write_ts = state_sample_ts
         finally:
             self._finish_segment(current, now_local())
             self.keyboard_counter.stop()
@@ -429,9 +561,227 @@ class ActivityTracker:
         }
         self.storage.append_segment(payload)
 
+    def _write_current_state_safe(
+        self,
+        current: SegmentState,
+        now: datetime,
+        previous_keyboard_snapshot: Counter[str],
+        previous_sample_ts: datetime,
+    ) -> tuple[Counter[str], datetime]:
+        try:
+            keyboard_diff = self.keyboard_counter.diff_since(previous_keyboard_snapshot)
+            interval_seconds = max(0.0, (now - previous_sample_ts).total_seconds())
+            idle_seconds = max(0, int((now - self.keyboard_counter.last_key_ts()).total_seconds()))
+            # v2: sample tool processes (fail-soft)
+            tool_processes = self._sample_tool_processes()
+            snapshot = build_current_state_snapshot(
+                now=now,
+                current=current,
+                idle_seconds=idle_seconds,
+                today_segments=self.storage.read_segments(now.date()),
+                keyboard_diff=keyboard_diff,
+                recent_interval_seconds=interval_seconds,
+                known_categories=self.rules.known_tags(),
+                tool_processes=tool_processes,
+                peak_concurrency=self._peak_concurrency,
+                peak_concurrency_at=self._peak_concurrency_at,
+            )
+            write_current_state_atomic(self.storage.root, snapshot)
+        except Exception as exc:
+            append_exception_log(self.storage.root / "agent_error.log", exc)
+        return self.keyboard_counter.snapshot(), now
+
+    @staticmethod
+    def _current_state_heartbeat_due(now: datetime, last_write_ts: datetime | None) -> bool:
+        if last_write_ts is None:
+            return True
+        return (now - last_write_ts).total_seconds() >= CURRENT_STATE_HEARTBEAT_SECONDS
+
     @staticmethod
     def _away_window() -> WindowInfo:
         return WindowInfo(title="Away", process_name="away", exe_path="")
+
+    # ── v2: process-level tracking ──
+
+    def _tool_wall_path(self, day: date) -> Path:
+        return self.storage.root / f"tool_wall_{day.isoformat()}.json"
+
+    def _load_tool_wall(self, day: date) -> dict[str, float]:
+        path = self._tool_wall_path(day)
+        if path.exists():
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _persist_tool_wall(self) -> None:
+        path = self._tool_wall_path(date.today())
+        try:
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(self._tool_wall_ceiling, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _sample_tool_processes(self) -> list[dict[str, Any]]:
+        """Sample running tool processes via psutil. Fail-soft: returns [] on any error."""
+        try:
+            import psutil  # type: ignore[import-untyped]
+        except ImportError:
+            return []
+
+        now = now_local()
+        today = now.date()
+
+        # Group raw processes by exe name
+        tool_groups: dict[str, list[Any]] = defaultdict(list)
+        try:
+            for proc in psutil.process_iter(["pid", "name", "create_time"]):
+                try:
+                    name: str = proc.info.get("name", "") or ""
+                    if name not in TOOL_MAP:
+                        continue
+                    tool_groups[name].append(proc)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+
+        # Collect window titles by PID
+        pid_titles: dict[int, str] = {}
+        try:
+            import win32gui
+            import win32process
+
+            def _enum_cb(hwnd: int, _ctx: Any) -> bool:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                try:
+                    _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+                    if wpid and wpid not in pid_titles:
+                        t = win32gui.GetWindowText(hwnd)
+                        if t:
+                            pid_titles[wpid] = t
+                except Exception:
+                    pass
+                return True
+
+            win32gui.EnumWindows(_enum_cb, None)
+        except Exception:
+            pass
+
+        # Aggregate by tool_id
+        agg: dict[str, dict[str, Any]] = {}
+        for exe_name, procs in tool_groups.items():
+            tool_info = TOOL_MAP[exe_name]
+            tool_id = tool_info["id"]
+
+            if tool_id not in agg:
+                agg[tool_id] = {
+                    "label": tool_info["label"],
+                    "exe": exe_name,
+                    "earliest_start": None,
+                    "total_cpu_minutes": 0.0,
+                    "pids": list[int](),
+                    "titles": list[str](),
+                }
+
+            entry = agg[tool_id]
+            for proc in procs:
+                try:
+                    pid: int = proc.pid
+                    create_ts = proc.info.get("create_time")
+                    if not create_ts:
+                        continue
+                    started_at = datetime.fromtimestamp(create_ts)
+
+                    if entry["earliest_start"] is None or started_at < entry["earliest_start"]:
+                        entry["earliest_start"] = started_at
+                    entry["pids"].append(pid)
+
+                    try:
+                        cpu = proc.cpu_times()
+                        entry["total_cpu_minutes"] += (cpu.user + cpu.system) / 60.0
+                    except Exception:
+                        pass
+
+                    title = pid_titles.get(pid, "")
+                    if title:
+                        entry["titles"].append(title)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+        # Build output list
+        results: list[dict[str, Any]] = []
+
+        for tool_id, entry in agg.items():
+            if not entry["pids"] or entry["earliest_start"] is None:
+                continue
+
+            # Track unique PIDs for session count
+            if tool_id not in self._tool_sessions:
+                self._tool_sessions[tool_id] = set()
+            for pid in entry["pids"]:
+                self._tool_sessions[tool_id].add(pid)
+            session_count = len(self._tool_sessions[tool_id])
+
+            # Wall time — today portion only
+            est: datetime = entry["earliest_start"]
+            if est.date() == today:
+                wall_seconds = (now - est).total_seconds()
+            elif est < datetime.combine(today, day_time.min):
+                wall_seconds = (now - datetime.combine(today, day_time.min)).total_seconds()
+            else:
+                wall_seconds = max(0.0, (now - est).total_seconds())
+
+            wall_minutes = round(wall_seconds / 60.0, 1)
+            cpu_minutes = round(entry["total_cpu_minutes"], 2)
+
+            # Persist wall ceiling: even if this process dies later, its contribution is preserved
+            merged_wall = max(wall_minutes, self._tool_wall_ceiling.get(tool_id, 0.0))
+            self._tool_wall_ceiling[tool_id] = merged_wall
+
+            # Best title + task hint
+            best_title = ""
+            task_hint: str | None = None
+            for title in entry["titles"]:
+                hint = extract_task_hint(title)
+                if hint:
+                    task_hint = hint
+                    if not best_title:
+                        best_title = title
+                elif not best_title:
+                    best_title = title
+
+            last_title = sanitize_title(best_title) if best_title else entry["exe"]
+
+            # Use persisted ceiling as wall (preserves dead-process contributions)
+            display_wall = self._tool_wall_ceiling.get(tool_id, wall_minutes)
+
+            results.append({
+                "id": tool_id,
+                "label": entry["label"],
+                "exe": entry["exe"],
+                "pid": entry["pids"][0],
+                "started_at": entry["earliest_start"].isoformat(timespec="seconds"),
+                "wall_minutes": display_wall,
+                "cpu_minutes": cpu_minutes,
+                "session_count": session_count,
+                "last_title": last_title,
+                "task_hint": task_hint,
+            })
+
+        # Persist wall ceiling after every sample
+        self._persist_tool_wall()
+
+        # Update concurrency peak
+        active_count = len(results)
+        if active_count > self._peak_concurrency:
+            self._peak_concurrency = active_count
+            self._peak_concurrency_at = now.isoformat(timespec="seconds")
+
+        return results
 
 
 def format_duration(seconds: float) -> str:
@@ -455,6 +805,134 @@ def bar(value: float, max_value: float, width: int = 18) -> str:
 def segment_tag(segment: dict[str, Any]) -> str:
     tags = segment.get("tags") or ["other"]
     return str(tags[0] if tags else "other")
+
+
+def segment_state_tag(segment: SegmentState) -> str:
+    if segment.is_away:
+        return "away"
+    return str(segment.tags[0] if segment.tags else "other")
+
+
+def ordered_category_seconds(
+    seconds_by_category: dict[str, int],
+    known_categories: Iterable[str] | None = None,
+) -> dict[str, int]:
+    categories = set(known_categories or [])
+    categories.update(seconds_by_category)
+    ordered = [category for category in CURRENT_STATE_CATEGORY_ORDER if category in categories]
+    ordered.extend(sorted(category for category in categories if category not in ordered))
+    return {category: int(seconds_by_category.get(category, 0)) for category in ordered}
+
+
+def build_current_state_snapshot(
+    *,
+    now: datetime,
+    current: SegmentState,
+    idle_seconds: int,
+    today_segments: list[dict[str, Any]],
+    keyboard_diff: Counter[str] | dict[str, int],
+    recent_interval_seconds: float,
+    known_categories: Iterable[str] | None = None,
+    tool_processes: list[dict[str, Any]] | None = None,
+    peak_concurrency: int = 0,
+    peak_concurrency_at: str | None = None,
+) -> dict[str, Any]:
+    today = now.date()
+    seconds_by_category: defaultdict[str, float] = defaultdict(float)
+
+    for segment in today_segments:
+        duration = float(segment.get("duration_sec") or 0)
+        if duration <= 0:
+            continue
+        seconds_by_category[segment_tag(segment)] += duration
+
+    current_start = max(current.start_ts, datetime.combine(today, day_time.min))
+    if current_start.date() == today and now > current_start:
+        seconds_by_category[segment_state_tag(current)] += (now - current_start).total_seconds()
+
+    rounded_seconds = {
+        category: int(round(seconds))
+        for category, seconds in seconds_by_category.items()
+        if seconds > 0
+    }
+    category_seconds = ordered_category_seconds(rounded_seconds, known_categories)
+    active_seconds = sum(seconds for category, seconds in category_seconds.items() if category != "away")
+    total_keys = int(keyboard_diff.get("total_keys") or 0)
+    if recent_interval_seconds > 0 and total_keys > 0:
+        recent_keys_per_min = round(total_keys / (recent_interval_seconds / 60.0), 1)
+    else:
+        recent_keys_per_min = 0.0
+
+    # ── v2: process-level fields ──
+    away_seconds_today = seconds_by_category.get("away", 0.0)
+
+    # Compute active ratio for effective wall time (avoid all-or-nothing away subtraction)
+    total_tracked = active_seconds + away_seconds_today
+    active_ratio = (active_seconds / total_tracked) if total_tracked > 0 else 1.0
+
+    # Add effective_wall_minutes to each process entry
+    processes: list[dict[str, Any]] = []
+    if tool_processes:
+        for p in tool_processes:
+            enriched = dict(p)
+            enriched["effective_wall_minutes"] = round(
+                float(p.get("wall_minutes", 0)) * active_ratio, 1
+            )
+            processes.append(enriched)
+
+    # Compute by_tool_minutes
+    by_tool_minutes: dict[str, dict[str, float]] = {}
+    for tool_id in TOOL_IDS:
+        by_tool_minutes[tool_id] = {"wall": 0.0, "cpu": 0.0, "effective": 0.0}
+
+    for p in processes:
+        tid = str(p.get("id", ""))
+        if tid in by_tool_minutes:
+            w = float(p.get("wall_minutes", 0))
+            c = float(p.get("cpu_minutes", 0))
+            e = float(p.get("effective_wall_minutes", 0))
+            by_tool_minutes[tid]["wall"] = max(by_tool_minutes[tid]["wall"], w)
+            by_tool_minutes[tid]["cpu"] = round(by_tool_minutes[tid]["cpu"] + c, 2)
+            by_tool_minutes[tid]["effective"] = max(by_tool_minutes[tid]["effective"], e)
+
+    # Round by_tool_minutes values
+    for tid in by_tool_minutes:
+        for k in ("wall", "cpu", "effective"):
+            by_tool_minutes[tid][k] = round(by_tool_minutes[tid][k], 1)
+
+    concurrency_peaks = {
+        "max_concurrent_tools": peak_concurrency,
+        "at": peak_concurrency_at,
+    }
+
+    return {
+        "schema_version": CURRENT_STATE_SCHEMA_VERSION,
+        "updated_at": now.isoformat(timespec="seconds"),
+        "current": {
+            "category": segment_state_tag(current),
+            "is_away": bool(current.is_away),
+            "idle_seconds": max(0, int(idle_seconds)),
+            "recent_keys_per_min": recent_keys_per_min,
+        },
+        "today": {
+            "date": today.isoformat(),
+            "active_seconds": int(active_seconds),
+            "by_category_seconds": category_seconds,
+            "by_tool_minutes": by_tool_minutes,
+            "concurrency_peaks": concurrency_peaks,
+        },
+        "processes": processes,
+    }
+
+
+def write_current_state_atomic(root: Path, snapshot: dict[str, Any]) -> None:
+    tmp_path = root / "current_state.json.tmp"
+    final_path = root / "current_state.json"
+    root.mkdir(parents=True, exist_ok=True)
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, final_path)
 
 
 def parse_ts(value: str) -> datetime:
@@ -761,6 +1239,18 @@ def generate_summary(day: date, storage: ActivityStorage, redacted: bool = False
     ):
         lines.append(f"{index}. {process:<24} {format_duration(seconds)}")
 
+    # ── 浏览器访问明细 ──
+    if not redacted and tag_seconds.get('browsing', 0) > 60:
+        domain_breakdown = browser_history.analyze_browser(segments)
+        if domain_breakdown:
+            sorted_domains = sorted(domain_breakdown.items(), key=lambda kv: kv[1], reverse=True)
+            lines.extend(["", "## 🌐 浏览明细"])
+            for domain, dur in sorted_domains[:10]:
+                lines.append(f"- {domain:<40} {format_duration(dur)}")
+            other_dur = sum(d for _, d in sorted_domains[10:])
+            if other_dur > 0:
+                lines.append(f"- {'其他':<40} {format_duration(other_dur)}")
+
     lines.extend(["", "## 归并时间线"])
     for item in merge_timeline(segments, redacted=redacted):
         start_label = item["start_ts"].strftime("%H:%M")
@@ -803,11 +1293,7 @@ def install_startup_task(script_path: Path) -> str:
 def log_unhandled_exception(exc: BaseException) -> None:
     try:
         storage = ActivityStorage()
-        log_path = storage.root / "agent_error.log"
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{now_local().isoformat(timespec='seconds')}]\n")
-            handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-            handle.write("\n")
+        append_exception_log(storage.root / "agent_error.log", exc)
     except Exception:
         pass
 

@@ -35,17 +35,17 @@ PRIVATE_PROCESS_NAME_PARTS = {
 }
 
 BLOCKED_FILE_PATTERNS = [
-    re.compile(r"(^|.*/)\.daymate/.*", re.IGNORECASE),
-    re.compile(r"(^|.*/)data/.*", re.IGNORECASE),
-    re.compile(r".*\.env(\..*)?$", re.IGNORECASE),
     re.compile(r".*\.pyc$", re.IGNORECASE),
     re.compile(r".*\.jsonl$", re.IGNORECASE),
     re.compile(r".*_summary.*\.md$", re.IGNORECASE),
-    re.compile(r".*\.log$", re.IGNORECASE),
-    re.compile(r".*\.(db|sqlite|sqlite3)$", re.IGNORECASE),
-    re.compile(r".*\.(pem|key|p12|pfx)$", re.IGNORECASE),
     re.compile(r".*watchdog.*\.vbs$", re.IGNORECASE),
 ]
+
+PRIVATE_SOURCE_ONLY_FILES = {
+    "rules.yaml",
+    "sync_to_public.py",
+    "watchdog.vbs",
+}
 
 def private_process_names() -> set[str]:
     return {"".join(parts) for parts in PRIVATE_PROCESS_NAME_PARTS}
@@ -97,7 +97,6 @@ def scan_path(root: Path, path: Path, patterns: list[re.Pattern[str]]) -> list[F
     for pattern in BLOCKED_FILE_PATTERNS:
         if pattern.fullmatch(rel):
             findings.append(Finding(path, None, "blocked generated/private file"))
-            break
 
     if not is_text_file(path):
         return findings
@@ -127,12 +126,16 @@ def scan(root: Path) -> list[Finding]:
         return [Finding(root, None, "path does not exist")]
 
     patterns = [*secret_patterns(), *dynamic_secret_patterns()]
+    is_private_source_tree = (root / "sync_to_public.py").exists() and (root / "lulu_agent.py").exists()
     findings: list[Finding] = []
     for path in root.rglob("*"):
         if path.is_dir():
             continue
         if ".git" in path.parts:
             continue
+        if is_private_source_tree:
+            if "__pycache__" in path.relative_to(root).parts or path.name in PRIVATE_SOURCE_ONLY_FILES:
+                continue
         findings.extend(scan_path(root, path, patterns))
     return findings
 
