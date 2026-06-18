@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as day_time, timedelta
 
 import browser_history
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -129,75 +131,216 @@ class SegmentState:
     is_away: bool = False
 
 
-class KeyboardCounter:
-    def __init__(self, keyboard_mod: Any):
-        self.keyboard = keyboard_mod
+# ── PollingKeyboardTracker: replaces pynput keyboard hooks ──
+# Uses GetLastInputInfo (zero-hook idle detection) + GetKeyboardState polling.
+# All work runs inside the existing 2-second poll loop, not on every keystroke.
+# This eliminates the WH_KEYBOARD_LL hook that was causing input latency.
+#
+# AdaptiveKeyCompensator (v2): models rolling typing profile and fills gaps when
+# detected keys fall below predicted rate — compensates for fast typists whose
+# key-down→key-up fits entirely inside one 2s poll window.
+
+from collections import deque
+import statistics
+
+_VK_LETTER_START = 0x41
+_VK_LETTER_END = 0x5A
+_VK_NUMBER_START = 0x30
+_VK_NUMBER_END = 0x39
+_VK_FUNC_START = 0x70
+_VK_FUNC_END = 0x87
+_VK_W = 0x57
+_VK_A = 0x41
+_VK_S = 0x53
+_VK_D = 0x44
+_VK_LEFT = 0x25
+_VK_UP = 0x26
+_VK_RIGHT = 0x27
+_VK_DOWN = 0x28
+_VK_BACK = 0x08
+_VK_DELETE = 0x2E
+_MODIFIER_VKS = frozenset({
+    0x10, 0x11, 0x12,          # Shift, Ctrl, Alt
+    0xA0, 0xA1,                # L/R Shift
+    0xA2, 0xA3,                # L/R Ctrl
+    0xA4, 0xA5,                # L/R Alt
+    0x14,                      # Caps Lock
+    0x5B, 0x5C,                # L/R Win
+})
+
+# Compensation tunables
+_COMP_WINDOW_SECONDS = 300.0    # rolling profile window (~5 min)
+_COMP_MIN_SAMPLES = 5            # need at least this many intervals to build profile
+_COMP_GAP_RATIO = 0.5            # trigger comp when detected < profile * this
+_COMP_DAMPING = 0.7              # dampening factor (0=ignore, 1=fully trust profile)
+_COMP_MAX_BOOST = 4.0            # cap compensation multiplier
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+class AdaptiveKeyCompensator:
+    """Models user typing profile from detected keys and compensates for sampling gaps.
+
+    Principle: even with 2s polling we *do* detect some keys every cycle — enough
+    to estimate true typing rate. When GetLastInputInfo confirms active typing but
+    detected count is below profile, we fill the gap with proportional compensation.
+    """
+
+    def __init__(self):
+        # Rolling window: (interval_seconds, total_keys_detected, category_counts)
+        self._window: deque[tuple[float, int, dict[str, int]]] = deque()
+        self._lock = threading.Lock()
+
+    def record(self, interval_sec: float, detected: Counter[str]) -> None:
+        """Record a poll interval's detection result into the rolling window."""
+        if interval_sec <= 0:
+            return
+        cat = {}
+        for k in ("letters", "numbers", "function_keys", "direction_keys", "modifier_keys", "delete_keys", "wasd_keys"):
+            cat[k] = int(detected.get(k, 0))
+        entry = (interval_sec, int(detected.get("total_keys", 0)), cat)
+        with self._lock:
+            self._window.append(entry)
+            # Evict old entries
+            total_age = 0.0
+            while self._window and total_age + self._window[0][0] > _COMP_WINDOW_SECONDS:
+                total_age += self._window[0][0]
+            while self._window:
+                s = sum(e[0] for e in self._window)
+                if s <= _COMP_WINDOW_SECONDS:
+                    break
+                self._window.popleft()
+
+    def compensate(self, interval_sec: float, detected: Counter[str]) -> Counter[str]:
+        """Return compensated counts. If profile is immature or detected is close to
+        predicted, returns detected as-is."""
+        with self._lock:
+            if len(self._window) < _COMP_MIN_SAMPLES:
+                return Counter(detected)
+
+            # Profile stats from window
+            recent = list(self._window)
+
+        total_detected = sum(e[1] for e in recent)
+        total_interval = sum(e[0] for e in recent)
+        if total_interval <= 0 or total_detected == 0:
+            return Counter(detected)
+
+        # Build category ratio profile (from all detected keys)
+        cat_totals: dict[str, float] = {}
+        for _, _, cats in recent:
+            for k, v in cats.items():
+                cat_totals[k] = cat_totals.get(k, 0.0) + v
+
+        profile_kps = total_detected / total_interval
+        detected_kps = detected.get("total_keys", 0) / interval_sec if interval_sec > 0 else 0
+
+        # Trigger: detected significantly below profile while actively typing
+        if profile_kps <= 0 or detected_kps >= profile_kps * _COMP_GAP_RATIO:
+            return Counter(detected)
+
+        # Gap = how many keys we probably missed
+        expected = profile_kps * interval_sec
+        gap = expected - detected.get("total_keys", 0)
+        gap = min(gap, profile_kps * interval_sec * _COMP_MAX_BOOST)  # cap
+        gap *= _COMP_DAMPING
+        if gap < 1:
+            return Counter(detected)
+
+        # Distribute gap across categories proportional to profile
+        result = Counter(detected)
+        for cat, cat_total in cat_totals.items():
+            ratio = cat_total / total_detected if total_detected > 0 else 0
+            compensated = int(round(gap * ratio))
+            if compensated > 0:
+                result[cat] = result.get(cat, 0) + compensated
+        result["total_keys"] = result.get("total_keys", 0) + int(round(gap))
+        return result
+
+
+class PollingKeyboardTracker:
+    """Keyboard idle detection + key counting — all via polling, no global hooks."""
+
+    def __init__(self):
         self._lock = threading.Lock()
         self._counts: Counter[str] = Counter()
         self._last_key_ts = now_local()
-        self._listener = None
-
-        self.direction_keys = self._keys("up", "down", "left", "right")
-        self.delete_keys = self._keys("backspace", "delete")
-        self.modifier_keys = self._keys(
-            "ctrl",
-            "ctrl_l",
-            "ctrl_r",
-            "shift",
-            "shift_l",
-            "shift_r",
-            "alt",
-            "alt_l",
-            "alt_r",
-            "alt_gr",
-            "cmd",
-            "cmd_l",
-            "cmd_r",
-            "caps_lock",
-        )
-        self.function_keys = self._keys(*[f"f{i}" for i in range(1, 25)])
-
-    def _keys(self, *names: str) -> set[Any]:
-        keys = set()
-        for name in names:
-            value = getattr(self.keyboard.Key, name, None)
-            if value is not None:
-                keys.add(value)
-        return keys
+        self._prev_state: tuple[int, ...] | None = None
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+        self._compensator = AdaptiveKeyCompensator()
+        self._last_poll_ts: datetime | None = None
 
     def start(self) -> None:
-        self._listener = self.keyboard.Listener(on_press=self.on_press)
-        self._listener.start()
+        """No-op: polling tracker doesn't need a listener thread."""
+        self._last_key_ts = now_local()
+        self._last_poll_ts = None
 
     def stop(self) -> None:
-        if self._listener is not None:
-            self._listener.stop()
+        """No-op."""
 
-    def on_press(self, key: Any) -> None:
+    def poll(self) -> None:
+        """Call once per poll cycle (~2s). Updates idle ts + key counts via state diff."""
+        now = now_local()
+        try:
+            # Idle detection via GetLastInputInfo
+            lii = _LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+            active_now = False
+            if self._user32.GetLastInputInfo(ctypes.byref(lii)):
+                uptime_ms = self._kernel32.GetTickCount64()
+                idle_ms = uptime_ms - lii.dwTime
+                self._last_key_ts = now - timedelta(milliseconds=max(0, idle_ms))
+                active_now = idle_ms < 2000  # user touched input in this interval
+
+            # Key counting via GetKeyboardState diff
+            import win32api
+            new_state = win32api.GetKeyboardState()
+            if self._prev_state is not None:
+                self._count_keys_diff(self._prev_state, new_state, now, active_now)
+            self._prev_state = new_state
+        except Exception:
+            pass
+
+    def _count_keys_diff(
+        self, prev: tuple[int, ...], curr: tuple[int, ...], now: datetime, active_now: bool
+    ) -> None:
+        """Detect newly-pressed keys and apply adaptive compensation."""
         updates: Counter[str] = Counter()
-        updates["total_keys"] += 1
+        for vk in range(256):
+            was_down = bool(prev[vk] & 0x80)
+            is_down = bool(curr[vk] & 0x80)
+            if is_down and not was_down:
+                updates["total_keys"] += 1
+                if _VK_LETTER_START <= vk <= _VK_LETTER_END:
+                    updates["letters"] += 1
+                    if vk in (_VK_W, _VK_A, _VK_S, _VK_D):
+                        updates["wasd_keys"] += 1
+                elif _VK_NUMBER_START <= vk <= _VK_NUMBER_END:
+                    updates["numbers"] += 1
+                elif _VK_FUNC_START <= vk <= _VK_FUNC_END:
+                    updates["function_keys"] += 1
+                if vk in (_VK_LEFT, _VK_UP, _VK_RIGHT, _VK_DOWN):
+                    updates["direction_keys"] += 1
+                if vk in (_VK_BACK, _VK_DELETE):
+                    updates["delete_keys"] += 1
+                if vk in _MODIFIER_VKS:
+                    updates["modifier_keys"] += 1
 
-        char = getattr(key, "char", None)
-        if char:
-            if char.isalpha():
-                updates["letters"] += 1
-            elif char.isdigit():
-                updates["numbers"] += 1
-            if char.lower() in {"w", "a", "s", "d"}:
-                updates["wasd_keys"] += 1
-        else:
-            if key in self.function_keys:
-                updates["function_keys"] += 1
-            if key in self.direction_keys:
-                updates["direction_keys"] += 1
-            if key in self.modifier_keys:
-                updates["modifier_keys"] += 1
-            if key in self.delete_keys:
-                updates["delete_keys"] += 1
+        # Adaptive compensation: feed detected → profile, then compensate if gap exists
+        if self._last_poll_ts is not None:
+            interval_sec = (now - self._last_poll_ts).total_seconds()
+            if updates["total_keys"] > 0 or active_now:
+                self._compensator.record(interval_sec, updates)
+            compensated = self._compensator.compensate(interval_sec, updates)
+            updates = compensated
+        self._last_poll_ts = now
 
-        with self._lock:
-            self._counts.update(updates)
-            self._last_key_ts = now_local()
+        if updates and updates["total_keys"] > 0:
+            with self._lock:
+                self._counts.update(updates)
 
     def snapshot(self) -> Counter[str]:
         with self._lock:
@@ -408,16 +551,11 @@ class ActivityTracker:
         poll_interval: float = 2.0,
         away_minutes: float = 5.0,
     ):
-        try:
-            from pynput import keyboard
-        except ImportError as exc:
-            raise RuntimeError("Missing dependency pynput. Run: pip install -r requirements.txt") from exc
-
         self.storage = storage
         self.rules = rules
         self.poll_interval = max(0.5, float(poll_interval))
         self.away_threshold = timedelta(minutes=max(0.1, float(away_minutes)))
-        self.keyboard_counter = KeyboardCounter(keyboard)
+        self.keyboard_counter = PollingKeyboardTracker()
         self._stop_event = threading.Event()
         # v2: process-level tracking state
         self._tool_sessions: dict[str, set[int]] = {}
@@ -429,7 +567,6 @@ class ActivityTracker:
         self._stop_event.set()
 
     def run(self) -> None:
-        self.keyboard_counter.start()
         active_window = get_active_window()
         current = self._start_segment(active_window, now_local())
         last_seen_window_key = active_window.key()
@@ -448,6 +585,7 @@ class ActivityTracker:
         try:
             while not self._stop_event.wait(self.poll_interval):
                 now = now_local()
+                self.keyboard_counter.poll()
                 state_changed = False
 
                 if current.start_ts.date() != now.date():
@@ -517,7 +655,6 @@ class ActivityTracker:
                     last_state_write_ts = state_sample_ts
         finally:
             self._finish_segment(current, now_local())
-            self.keyboard_counter.stop()
 
     def _start_segment(self, window: WindowInfo, start_ts: datetime, is_away: bool = False) -> SegmentState:
         tags = ["away"] if is_away else self.rules.match(window)
