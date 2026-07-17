@@ -25,6 +25,8 @@ from typing import Any, Iterable
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RULES_PATH = SCRIPT_DIR / "rules.yaml"
 TASK_NAME = "DayMateActivityTracker"
+AGENT_MUTEX_NAME = r"Local\DayMateActivityTrackerAgent"
+ERROR_ALREADY_EXISTS = 183
 CURRENT_STATE_SCHEMA_VERSION = 2
 CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
 CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "away"]
@@ -89,6 +91,25 @@ def parse_date(value: str | None) -> date:
 
 def default_data_root() -> Path:
     return Path.home() / ".daymate" / "data"
+
+
+def acquire_single_instance_mutex() -> int | None:
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, AGENT_MUTEX_NAME)
+    if not handle:
+        raise ctypes.WinError()
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def release_single_instance_mutex(handle: int) -> None:
+    ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def empty_keyboard_stats() -> dict[str, int]:
@@ -1468,6 +1489,10 @@ def main(argv: list[str] | None = None) -> int:
         print(generate_summary(summary_day, storage, redacted=args.summary_redacted is not None))
         return 0
 
+    instance_mutex = acquire_single_instance_mutex()
+    if instance_mutex is None:
+        return 0
+
     rules = RuleEngine(args.rules)
     tracker = ActivityTracker(
         storage=storage,
@@ -1479,6 +1504,8 @@ def main(argv: list[str] | None = None) -> int:
         tracker.run()
     except KeyboardInterrupt:
         tracker.stop()
+    finally:
+        release_single_instance_mutex(instance_mutex)
     return 0
 
 
