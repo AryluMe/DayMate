@@ -2,6 +2,8 @@ default_tag: other
 rules:
 - process: assistant.exe
   tag: coding
+- process: assistant-host.exe
+  tag: coding
 - process: editor.exe
   tag: coding
 - process: terminal.exe

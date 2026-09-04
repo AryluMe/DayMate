@@ -34,20 +34,17 @@ TOOL_ACTIVITY_MIN_CPU_FRACTION = 0.05
 
 # ── v2: process-level tracking ──
 TOOL_MAP: dict[str, dict[str, str]] = {
-    "assistant.exe": {"id": "assistant", "label": "Assistant", "category": "coding"},
-    "editor.exe": {"id": "editor", "label": "Editor", "category": "coding"},
+    "assistant.exe": {"id": "codex_main", "label": "Codex", "category": "coding"},
+    "assistant-host.exe": {"id": "codex_main", "label": "Codex", "category": "coding"},
+    "assistant-host.exe": {"id": "codex_main", "label": "Codex", "category": "coding"},
+    "assistant-cli.exe": {"id": "claude_code", "label": "Claude Code", "category": "coding"},
+    "editor.exe": {"id": "ide", "label": "VS Code", "category": "coding"},
+    "editor.exe": {"id": "ide", "label": "Cursor", "category": "coding"},
     "terminal.exe": {"id": "terminal", "label": "Terminal", "category": "coding"},
-    "browser.exe": {"id": "browser", "label": "Browser", "category": "browsing"},
-    "chat-client.exe": {"id": "chat", "label": "Chat", "category": "chat"},
-    "game.exe": {"id": "game", "label": "Game", "category": "gaming"},
-    "game-launcher.exe": {"id": "game-launcher", "label": "Game Launcher", "category": "gaming"},
-    "file-manager.exe": {"id": "file-manager", "label": "File Manager", "category": "other"},
-    "python.exe": {"id": "python", "label": "Python", "category": "coding"},
-    "pythonw.exe": {"id": "pythonw", "label": "Python", "category": "coding"},
-    "wt.exe": {"id": "terminal", "label": "Terminal", "category": "coding"},
+    "terminal.exe": {"id": "terminal", "label": "Terminal", "category": "coding"},
 }
-TOOL_IDS = {"assistant", "editor", "terminal", "browser", "chat", "game", "game-launcher", "file-manager", "python", "pythonw"}
-TOOL_ACTIVITY_ONLY_PROCESSES = {"assistant.exe"}
+TOOL_IDS = {"codex_main", "claude_code", "ide", "terminal"}
+TOOL_ACTIVITY_ONLY_PROCESSES = {"assistant.exe", "assistant-host.exe"}
 _TOOL_MAP_CASEFOLD = {name.casefold(): (name, info) for name, info in TOOL_MAP.items()}
 
 _TASK_RE = re.compile(r"T(\d{1,3})\s*[-\u2013\u2014]\s*(.+)")
