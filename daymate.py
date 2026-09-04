@@ -30,6 +30,7 @@ ERROR_ALREADY_EXISTS = 183
 CURRENT_STATE_SCHEMA_VERSION = 2
 CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
 CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "away"]
+TOOL_ACTIVITY_MIN_CPU_FRACTION = 0.05
 
 # ── v2: process-level tracking ──
 TOOL_MAP: dict[str, dict[str, str]] = {
@@ -43,8 +44,11 @@ TOOL_MAP: dict[str, dict[str, str]] = {
     "file-manager.exe": {"id": "file-manager", "label": "File Manager", "category": "other"},
     "python.exe": {"id": "python", "label": "Python", "category": "coding"},
     "pythonw.exe": {"id": "pythonw", "label": "Python", "category": "coding"},
+    "wt.exe": {"id": "terminal", "label": "Terminal", "category": "coding"},
 }
 TOOL_IDS = {"assistant", "editor", "terminal", "browser", "chat", "game", "game-launcher", "file-manager", "python", "pythonw"}
+TOOL_ACTIVITY_ONLY_PROCESSES = {"assistant.exe"}
+_TOOL_MAP_CASEFOLD = {name.casefold(): (name, info) for name, info in TOOL_MAP.items()}
 
 _TASK_RE = re.compile(r"T(\d{1,3})\s*[-\u2013\u2014]\s*(.+)")
 _TASK_BARE_RE = re.compile(r"\bT(\d{1,3})\b")
@@ -132,6 +136,11 @@ def counter_to_keyboard_stats(counter: Counter[str]) -> dict[str, int]:
     return stats
 
 
+def resolve_tool_process(process_name: str) -> tuple[str, dict[str, str]] | None:
+    """Resolve a Windows process name without relying on its reported casing."""
+    return _TOOL_MAP_CASEFOLD.get(process_name.casefold())
+
+
 @dataclass(frozen=True)
 class WindowInfo:
     title: str
@@ -140,6 +149,87 @@ class WindowInfo:
 
     def key(self) -> tuple[str, str]:
         return (self.process_name.lower(), self.title)
+
+
+@dataclass(frozen=True)
+class ProcessCpuSample:
+    process_name: str
+    pid: int
+    create_time: float
+    cpu_seconds: float
+
+
+class ToolProcessActivityTracker:
+    """Detect tool work that bypasses the current Windows session's input clock.
+
+    CPU deltas are used instead of process presence, so an open but idle tool does
+    not keep the user active. No command lines, titles, input, or screen content are
+    inspected.
+    """
+
+    def __init__(self, min_cpu_fraction: float = TOOL_ACTIVITY_MIN_CPU_FRACTION):
+        self.min_cpu_fraction = max(0.0, float(min_cpu_fraction))
+        self._previous_cpu: dict[tuple[int, float], float] = {}
+        self._last_poll_ts: datetime | None = None
+
+    def observe(self, samples: Iterable[ProcessCpuSample], now: datetime) -> WindowInfo | None:
+        current_cpu: dict[tuple[int, float], float] = {}
+        cpu_delta_by_process: defaultdict[str, float] = defaultdict(float)
+
+        for sample in samples:
+            resolved = resolve_tool_process(sample.process_name)
+            if resolved is None:
+                continue
+            canonical_name, _ = resolved
+            identity = (int(sample.pid), float(sample.create_time))
+            cpu_seconds = max(0.0, float(sample.cpu_seconds))
+            current_cpu[identity] = cpu_seconds
+            previous = self._previous_cpu.get(identity)
+            if previous is not None:
+                cpu_delta_by_process[canonical_name] += max(0.0, cpu_seconds - previous)
+
+        previous_poll_ts = self._last_poll_ts
+        self._previous_cpu = current_cpu
+        self._last_poll_ts = now
+        if previous_poll_ts is None:
+            return None
+
+        interval_seconds = (now - previous_poll_ts).total_seconds()
+        if interval_seconds <= 0 or not cpu_delta_by_process:
+            return None
+
+        process_name, cpu_delta = max(cpu_delta_by_process.items(), key=lambda item: item[1])
+        if cpu_delta / interval_seconds < self.min_cpu_fraction:
+            return None
+        return WindowInfo(title="", process_name=process_name, exe_path="")
+
+    def poll(self, now: datetime) -> WindowInfo | None:
+        try:
+            import psutil  # type: ignore[import-untyped]
+        except ImportError:
+            return None
+
+        samples: list[ProcessCpuSample] = []
+        try:
+            for proc in psutil.process_iter(["pid", "name", "create_time"]):
+                try:
+                    process_name = str(proc.info.get("name") or "")
+                    if resolve_tool_process(process_name) is None:
+                        continue
+                    cpu = proc.cpu_times()
+                    samples.append(
+                        ProcessCpuSample(
+                            process_name=process_name,
+                            pid=int(proc.pid),
+                            create_time=float(proc.info.get("create_time") or 0.0),
+                            cpu_seconds=float(cpu.user + cpu.system),
+                        )
+                    )
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            return None
+        return self.observe(samples, now)
 
 
 @dataclass
@@ -577,6 +667,7 @@ class ActivityTracker:
         self.poll_interval = max(0.5, float(poll_interval))
         self.away_threshold = timedelta(minutes=max(0.1, float(away_minutes)))
         self.keyboard_counter = PollingKeyboardTracker()
+        self.tool_activity = ToolProcessActivityTracker()
         self._stop_event = threading.Event()
         # v2: process-level tracking state
         self._tool_sessions: dict[str, set[int]] = {}
@@ -600,6 +691,7 @@ class ActivityTracker:
             state_sample_ts,
             state_keyboard_snapshot,
             state_sample_ts,
+            last_activity_ts=last_activity_ts,
         )
         last_state_write_ts = state_sample_ts
 
@@ -624,17 +716,26 @@ class ActivityTracker:
                 window_changed = active_key != last_seen_window_key
                 key_activity_ts = self.keyboard_counter.last_key_ts()
                 key_activity = key_activity_ts > last_activity_ts
+                tool_activity_window = self.tool_activity.poll(now)
+                tool_activity = tool_activity_window is not None
 
                 if window_changed:
                     last_seen_window_key = active_key
                     last_activity_ts = now
                 elif key_activity:
                     last_activity_ts = key_activity_ts
+                elif tool_activity:
+                    last_activity_ts = now
 
                 if current.is_away:
-                    if window_changed or key_activity:
+                    if window_changed or key_activity or tool_activity:
                         self._finish_segment(current, now, keyboard_stats=empty_keyboard_stats())
-                        current = self._start_segment(active_window, now)
+                        resumed_window = (
+                            tool_activity_window
+                            if tool_activity and not (window_changed or key_activity)
+                            else active_window
+                        )
+                        current = self._start_segment(resumed_window, now)
                         state_changed = True
                     if state_changed or self._current_state_heartbeat_due(now, last_state_write_ts):
                         state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
@@ -642,6 +743,7 @@ class ActivityTracker:
                             now,
                             state_keyboard_snapshot,
                             state_sample_ts,
+                            last_activity_ts=last_activity_ts,
                         )
                         last_state_write_ts = state_sample_ts
                     continue
@@ -657,6 +759,7 @@ class ActivityTracker:
                         now,
                         state_keyboard_snapshot,
                         state_sample_ts,
+                        last_activity_ts=last_activity_ts,
                     )
                     last_state_write_ts = state_sample_ts
                     continue
@@ -665,6 +768,10 @@ class ActivityTracker:
                     self._finish_segment(current, now)
                     current = self._start_segment(active_window, now)
                     state_changed = True
+                elif tool_activity and segment_state_tag(current) == "other":
+                    self._finish_segment(current, now)
+                    current = self._start_segment(tool_activity_window, now)
+                    state_changed = True
 
                 if state_changed or self._current_state_heartbeat_due(now, last_state_write_ts):
                     state_keyboard_snapshot, state_sample_ts = self._write_current_state_safe(
@@ -672,6 +779,7 @@ class ActivityTracker:
                         now,
                         state_keyboard_snapshot,
                         state_sample_ts,
+                        last_activity_ts=last_activity_ts,
                     )
                     last_state_write_ts = state_sample_ts
         finally:
@@ -725,11 +833,13 @@ class ActivityTracker:
         now: datetime,
         previous_keyboard_snapshot: Counter[str],
         previous_sample_ts: datetime,
+        last_activity_ts: datetime | None = None,
     ) -> tuple[Counter[str], datetime]:
         try:
             keyboard_diff = self.keyboard_counter.diff_since(previous_keyboard_snapshot)
             interval_seconds = max(0.0, (now - previous_sample_ts).total_seconds())
-            idle_seconds = max(0, int((now - self.keyboard_counter.last_key_ts()).total_seconds()))
+            effective_activity_ts = last_activity_ts or self.keyboard_counter.last_key_ts()
+            idle_seconds = max(0, int((now - effective_activity_ts).total_seconds()))
             # v2: sample tool processes (fail-soft)
             tool_processes = self._sample_tool_processes()
             snapshot = build_current_state_snapshot(
@@ -798,9 +908,13 @@ class ActivityTracker:
             for proc in psutil.process_iter(["pid", "name", "create_time"]):
                 try:
                     name: str = proc.info.get("name", "") or ""
-                    if name not in TOOL_MAP:
+                    resolved = resolve_tool_process(name)
+                    if resolved is None:
                         continue
-                    tool_groups[name].append(proc)
+                    canonical_name, _ = resolved
+                    if canonical_name in TOOL_ACTIVITY_ONLY_PROCESSES:
+                        continue
+                    tool_groups[canonical_name].append(proc)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
         except Exception:
