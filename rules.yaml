@@ -16,25 +16,47 @@ rules:
   tag: browsing
 - process: chat-client.exe
   tag: chat
+- process: League of Legends.exe
+  tag: gaming
 - process: game.exe
   tag: gaming
-- process: game-launcher.exe
+- process: Overwatch.exe
   tag: gaming
-- process: Overwatch*
+- process: csgo.exe
   tag: gaming
-- process: csgo*
+- process: cs2.exe
   tag: gaming
-- process: cs2*
+- process: Sultan's Game.exe
   tag: gaming
-- process: Sultan*
+- process: TOTClient-Win64-Shipping.exe
   tag: gaming
-- process: TOTClient*
+- process: Hearthstone.exe
   tag: gaming
-- process: Battle.net*
+- process: TslGame.exe
   tag: gaming
-- process: Hearthstone*
+- process: 007FirstLight.exe
   tag: gaming
-- process: TslGame*
+- process: SB-Win64-Shipping.exe
+  tag: gaming
+- process: SB-Win64-Shipping.exe
+  tag: other
+- process: StreetFighter6.exe
+  tag: gaming
+- process: NarakaBladepoint.exe
+  tag: gaming
+- process: VALORANT-Win64-Shipping.exe
+  tag: gaming
+- process: b1-Win64-Shipping.exe
+  tag: gaming
+- process: WD-Win64-Shipping.exe
+  tag: gaming
+- process: HuntGame.exe
+  tag: gaming
+- process: DyingLightGame_x64_rwdi.exe
+  tag: gaming
+- process: Olivia.exe
+  tag: gaming
+- process: 植物大战僵尸杂交版*.exe
   tag: gaming
 - process: file-manager.exe
   tag: other

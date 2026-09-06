@@ -285,7 +285,7 @@ _COMP_MAX_BOOST = 4.0            # cap compensation multiplier
 
 
 class _LASTINPUTINFO(ctypes.Structure):
-    _fields = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
 
 class AdaptiveKeyCompensator:
@@ -375,15 +375,21 @@ class PollingKeyboardTracker:
         self._lock = threading.Lock()
         self._counts: Counter[str] = Counter()
         self._last_key_ts = now_local()
+        self._last_input_tick: int | None = None
         self._prev_state: tuple[int, ...] | None = None
         self._user32 = ctypes.windll.user32
         self._kernel32 = ctypes.windll.kernel32
+        self._user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+        self._user32.GetLastInputInfo.restype = wintypes.BOOL
+        self._kernel32.GetTickCount64.argtypes = []
+        self._kernel32.GetTickCount64.restype = ctypes.c_ulonglong
         self._compensator = AdaptiveKeyCompensator()
         self._last_poll_ts: datetime | None = None
 
     def start(self) -> None:
         """No-op: polling tracker doesn't need a listener thread."""
         self._last_key_ts = now_local()
+        self._last_input_tick = None
         self._last_poll_ts = None
 
     def stop(self) -> None:
@@ -399,8 +405,11 @@ class PollingKeyboardTracker:
             active_now = False
             if self._user32.GetLastInputInfo(ctypes.byref(lii)):
                 uptime_ms = self._kernel32.GetTickCount64()
-                idle_ms = uptime_ms - lii.dwTime
-                self._last_key_ts = now - timedelta(milliseconds=max(0, idle_ms))
+                # LASTINPUTINFO contains a 32-bit tick, including its wraparound.
+                idle_ms = (uptime_ms - lii.dwTime) & 0xFFFFFFFF
+                if lii.dwTime != self._last_input_tick:
+                    self._last_key_ts = now - timedelta(milliseconds=idle_ms)
+                    self._last_input_tick = lii.dwTime
                 active_now = idle_ms < 2000  # user touched input in this interval
 
             # Key counting via GetKeyboardState diff
@@ -714,7 +723,9 @@ class ActivityTracker:
                 key_activity_ts = self.keyboard_counter.last_key_ts()
                 key_activity = key_activity_ts > last_activity_ts
                 tool_activity_window = self.tool_activity.poll(now)
-                tool_activity = tool_activity_window is not None
+                # Background AI work is not evidence that a foreground game is
+                # being played. Keep the existing fallback for remote tool use.
+                tool_activity = tool_activity_window is not None and "gaming" not in self.rules.match(active_window)
 
                 if window_changed:
                     last_seen_window_key = active_key
