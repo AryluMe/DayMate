@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as day_time, timedelta
 
 import browser_history
+import hardware_monitor
+from presence import Presence, remote_connection_kind
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
@@ -29,7 +31,7 @@ AGENT_MUTEX_NAME = r"Local\DayMateActivityTrackerAgent"
 ERROR_ALREADY_EXISTS = 183
 CURRENT_STATE_SCHEMA_VERSION = 2
 CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
-CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "away"]
+CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "hangup", "away"]
 TOOL_ACTIVITY_MIN_CPU_FRACTION = 0.05
 
 # ── v2: process-level tracking ──
@@ -503,6 +505,10 @@ class RuleEngine:
     def match(self, window: WindowInfo) -> list[str]:
         process = window.process_name.lower()
         title = window.title.lower()
+        # Bilibili black/full-screen playback is挂机: programs run while the
+        # person may be away. Keep this distinct from human absence (away).
+        if process in {"browser.exe", "browser.exe", "browser.exe"} and "bilibili" in title:
+            return ["hangup"]
         best_rule: dict[str, Any] | None = None
         best_score = -1
 
@@ -674,6 +680,7 @@ class ActivityTracker:
         self.away_threshold = timedelta(minutes=max(0.1, float(away_minutes)))
         self.keyboard_counter = PollingKeyboardTracker()
         self.tool_activity = ToolProcessActivityTracker()
+        self.presence = Presence()
         self._stop_event = threading.Event()
         # v2: process-level tracking state
         self._tool_sessions: dict[str, set[int]] = {}
@@ -688,7 +695,12 @@ class ActivityTracker:
         active_window = get_active_window()
         current = self._start_segment(active_window, now_local())
         last_seen_window_key = active_window.key()
-        last_activity_ts = now_local()
+        last_foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        self.keyboard_counter.poll()
+        last_activity_ts = self.keyboard_counter.last_key_ts()
+        self.presence.sample(now_local(), last_activity_ts, False, False, remote_connection_kind())
+        if now_local() - last_activity_ts >= self.away_threshold:
+            current = self._start_segment(self._away_window(), now_local(), is_away=True)
         state_keyboard_snapshot = self.keyboard_counter.snapshot()
         state_sample_ts = now_local()
         last_state_write_ts: datetime | None = None
@@ -720,6 +732,9 @@ class ActivityTracker:
                 active_window = get_active_window()
                 active_key = active_window.key()
                 window_changed = active_key != last_seen_window_key
+                foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
+                human_window_changed = bool(foreground_hwnd and foreground_hwnd != last_foreground_hwnd)
+                last_foreground_hwnd = foreground_hwnd
                 key_activity_ts = self.keyboard_counter.last_key_ts()
                 key_activity = key_activity_ts > last_activity_ts
                 tool_activity_window = self.tool_activity.poll(now)
@@ -729,14 +744,15 @@ class ActivityTracker:
 
                 if window_changed:
                     last_seen_window_key = active_key
+                if human_window_changed:
                     last_activity_ts = now
                 elif key_activity:
                     last_activity_ts = key_activity_ts
-                elif tool_activity:
-                    last_activity_ts = now
+                self.presence.sample(now, key_activity_ts, human_window_changed,
+                                     tool_activity_window is not None, remote_connection_kind())
 
                 if current.is_away:
-                    if window_changed or key_activity or tool_activity:
+                    if human_window_changed or key_activity:
                         self._finish_segment(current, now, keyboard_stats=empty_keyboard_stats())
                         resumed_window = (
                             tool_activity_window
@@ -862,6 +878,8 @@ class ActivityTracker:
                 peak_concurrency=self._peak_concurrency,
                 peak_concurrency_at=self._peak_concurrency_at,
             )
+            snapshot['current'].update(self.presence.fields(now))
+            snapshot['hardware'] = hardware_monitor.snapshot()
             write_current_state_atomic(self.storage.root, snapshot)
         except Exception as exc:
             append_exception_log(self.storage.root / "agent_error.log", exc)
@@ -1136,7 +1154,8 @@ def build_current_state_snapshot(
         if seconds > 0
     }
     category_seconds = ordered_category_seconds(rounded_seconds, known_categories)
-    active_seconds = sum(seconds for category, seconds in category_seconds.items() if category != "away")
+    active_seconds = sum(seconds for category, seconds in category_seconds.items() if category not in {"away", "hangup"})
+    hangup_seconds_today = seconds_by_category.get("hangup", 0.0)
     total_keys = int(keyboard_diff.get("total_keys") or 0)
     if recent_interval_seconds > 0 and total_keys > 0:
         recent_keys_per_min = round(total_keys / (recent_interval_seconds / 60.0), 1)
@@ -1193,6 +1212,7 @@ def build_current_state_snapshot(
             "is_away": bool(current.is_away),
             "idle_seconds": max(0, int(idle_seconds)),
             "recent_keys_per_min": recent_keys_per_min,
+            "is_hangup": segment_state_tag(current) == "hangup",
         },
         "today": {
             "date": today.isoformat(),
@@ -1200,6 +1220,7 @@ def build_current_state_snapshot(
             "by_category_seconds": category_seconds,
             "by_tool_minutes": by_tool_minutes,
             "concurrency_peaks": concurrency_peaks,
+            "hangup_seconds": int(round(hangup_seconds_today)),
         },
         "processes": processes,
     }
@@ -1638,3 +1659,5 @@ if __name__ == "__main__":
         if not isinstance(exc, SystemExit):
             log_unhandled_exception(exc)
         raise
+
+
