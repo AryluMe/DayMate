@@ -29,7 +29,7 @@ DEFAULT_RULES_PATH = SCRIPT_DIR / "rules.yaml"
 TASK_NAME = "DayMateActivityTracker"
 AGENT_MUTEX_NAME = r"Local\DayMateActivityTrackerAgent"
 ERROR_ALREADY_EXISTS = 183
-CURRENT_STATE_SCHEMA_VERSION = 2
+CURRENT_STATE_SCHEMA_VERSION = 3
 CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
 CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "hangup", "away"]
 TOOL_ACTIVITY_MIN_CPU_FRACTION = 0.05
@@ -242,7 +242,7 @@ class SegmentState:
 
 
 # ── PollingKeyboardTracker: replaces pynput keyboard hooks ──
-# Uses GetLastInputInfo (zero-hook idle detection) + GetKeyboardState polling.
+# Uses GetLastInputInfo (zero-hook idle detection) + GetAsyncKeyState polling.
 # All work runs inside the existing 2-second poll loop, not on every keystroke.
 # This eliminates the WH_KEYBOARD_LL hook that was causing input latency.
 #
@@ -371,21 +371,19 @@ class AdaptiveKeyCompensator:
 
 
 class PollingKeyboardTracker:
-    """Keyboard idle detection + key counting — all via polling, no global hooks."""
+    """OS-level human activity clock with v2 keyboard compatibility shims."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._counts: Counter[str] = Counter()
         self._last_key_ts = now_local()
         self._last_input_tick: int | None = None
-        self._prev_state: tuple[int, ...] | None = None
         self._user32 = ctypes.windll.user32
         self._kernel32 = ctypes.windll.kernel32
         self._user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
         self._user32.GetLastInputInfo.restype = wintypes.BOOL
         self._kernel32.GetTickCount64.argtypes = []
         self._kernel32.GetTickCount64.restype = ctypes.c_ulonglong
-        self._compensator = AdaptiveKeyCompensator()
         self._last_poll_ts: datetime | None = None
 
     def start(self) -> None:
@@ -398,13 +396,12 @@ class PollingKeyboardTracker:
         """No-op."""
 
     def poll(self) -> None:
-        """Call once per poll cycle (~2s). Updates idle ts + key counts via state diff."""
+        """Call once per poll cycle (~2s). Updates only the OS input timestamp."""
         now = now_local()
         try:
             # Idle detection via GetLastInputInfo
             lii = _LASTINPUTINFO()
             lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
-            active_now = False
             if self._user32.GetLastInputInfo(ctypes.byref(lii)):
                 uptime_ms = self._kernel32.GetTickCount64()
                 # LASTINPUTINFO contains a 32-bit tick, including its wraparound.
@@ -412,54 +409,20 @@ class PollingKeyboardTracker:
                 if lii.dwTime != self._last_input_tick:
                     self._last_key_ts = now - timedelta(milliseconds=idle_ms)
                     self._last_input_tick = lii.dwTime
-                active_now = idle_ms < 2000  # user touched input in this interval
-
-            # Key counting via GetKeyboardState diff
-            import win32api
-            new_state = win32api.GetKeyboardState()
-            if self._prev_state is not None:
-                self._count_keys_diff(self._prev_state, new_state, now, active_now)
-            self._prev_state = new_state
+                # v3 intentionally does not sample individual keys. GetLastInputInfo
+                # is the sole human activity signal and works for remote sessions.
+            self._last_poll_ts = now
         except Exception:
             pass
+
+    def _keyboard_state(self) -> tuple[int, ...]:
+        return ()
 
     def _count_keys_diff(
         self, prev: tuple[int, ...], curr: tuple[int, ...], now: datetime, active_now: bool
     ) -> None:
-        """Detect newly-pressed keys and apply adaptive compensation."""
-        updates: Counter[str] = Counter()
-        for vk in range(256):
-            was_down = bool(prev[vk] & 0x80)
-            is_down = bool(curr[vk] & 0x80)
-            if is_down and not was_down:
-                updates["total_keys"] += 1
-                if _VK_LETTER_START <= vk <= _VK_LETTER_END:
-                    updates["letters"] += 1
-                    if vk in (_VK_W, _VK_A, _VK_S, _VK_D):
-                        updates["wasd_keys"] += 1
-                elif _VK_NUMBER_START <= vk <= _VK_NUMBER_END:
-                    updates["numbers"] += 1
-                elif _VK_FUNC_START <= vk <= _VK_FUNC_END:
-                    updates["function_keys"] += 1
-                if vk in (_VK_LEFT, _VK_UP, _VK_RIGHT, _VK_DOWN):
-                    updates["direction_keys"] += 1
-                if vk in (_VK_BACK, _VK_DELETE):
-                    updates["delete_keys"] += 1
-                if vk in _MODIFIER_VKS:
-                    updates["modifier_keys"] += 1
-
-        # Adaptive compensation: feed detected → profile, then compensate if gap exists
-        if self._last_poll_ts is not None:
-            interval_sec = (now - self._last_poll_ts).total_seconds()
-            if updates["total_keys"] > 0 or active_now:
-                self._compensator.record(interval_sec, updates)
-            compensated = self._compensator.compensate(interval_sec, updates)
-            updates = compensated
-        self._last_poll_ts = now
-
-        if updates and updates["total_keys"] > 0:
-            with self._lock:
-                self._counts.update(updates)
+        # Retained for callers that still load v2 history; v3 writes no key data.
+        return
 
     def snapshot(self) -> Counter[str]:
         with self._lock:
@@ -601,6 +564,13 @@ class ActivityStorage:
 def append_exception_log(log_path: Path, exc: BaseException) -> None:
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        if log_path.exists() and log_path.stat().st_size > 1_000_000:
+            rotated = log_path.with_suffix(log_path.suffix + ".1")
+            try:
+                rotated.unlink(missing_ok=True)
+            except OSError:
+                pass
+            log_path.replace(rotated)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"[{now_local().isoformat(timespec='seconds')}]\n")
             handle.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
@@ -846,7 +816,6 @@ class ActivityTracker:
                 "process_name": segment.window.process_name,
                 "exe_path": segment.window.exe_path,
             },
-            "keyboard": keyboard_stats,
             "tags": segment.tags,
         }
         self.storage.append_segment(payload)
@@ -1156,12 +1125,6 @@ def build_current_state_snapshot(
     category_seconds = ordered_category_seconds(rounded_seconds, known_categories)
     active_seconds = sum(seconds for category, seconds in category_seconds.items() if category not in {"away", "hangup"})
     hangup_seconds_today = seconds_by_category.get("hangup", 0.0)
-    total_keys = int(keyboard_diff.get("total_keys") or 0)
-    if recent_interval_seconds > 0 and total_keys > 0:
-        recent_keys_per_min = round(total_keys / (recent_interval_seconds / 60.0), 1)
-    else:
-        recent_keys_per_min = 0.0
-
     # ── v2: process-level fields ──
     away_seconds_today = seconds_by_category.get("away", 0.0)
 
@@ -1211,7 +1174,7 @@ def build_current_state_snapshot(
             "category": segment_state_tag(current),
             "is_away": bool(current.is_away),
             "idle_seconds": max(0, int(idle_seconds)),
-            "recent_keys_per_min": recent_keys_per_min,
+            "human_active": bool(idle_seconds < 300 and not current.is_away),
             "is_hangup": segment_state_tag(current) == "hangup",
         },
         "today": {
