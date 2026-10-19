@@ -33,6 +33,10 @@ CURRENT_STATE_SCHEMA_VERSION = 3
 CURRENT_STATE_HEARTBEAT_SECONDS = 30.0
 CURRENT_STATE_CATEGORY_ORDER = ["coding", "browsing", "gaming", "chat", "other", "hangup", "away"]
 TOOL_ACTIVITY_MIN_CPU_FRACTION = 0.05
+# v3.1 perf (2026-10-18): tool CPU-delta sampling scans the full process table,
+# which costs 150-300ms per pass on a busy dev machine. Tool sessions last
+# minutes, so a 10s cadence is functionally equivalent to a 2s one.
+TOOL_POLL_MIN_INTERVAL_SECONDS = 10.0
 
 # ── v2: process-level tracking ──
 TOOL_MAP: dict[str, dict[str, str]] = {
@@ -206,6 +210,14 @@ class ToolProcessActivityTracker:
         try:
             import psutil  # type: ignore[import-untyped]
         except ImportError:
+            return None
+
+        # v3.1 perf: full process-table scans are expensive; only run at the
+        # tool-poll cadence, not on every 2s window poll.
+        if (
+            self._last_poll_ts is not None
+            and (now - self._last_poll_ts).total_seconds() < TOOL_POLL_MIN_INTERVAL_SECONDS
+        ):
             return None
 
         samples: list[ProcessCpuSample] = []
