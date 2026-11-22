@@ -17,6 +17,7 @@ from datetime import date, datetime, time as day_time, timedelta
 
 import browser_history
 import hardware_monitor
+from app_activity import AppActivity
 from presence import Presence, remote_connection_kind
 import ctypes
 from ctypes import wintypes
@@ -149,6 +150,8 @@ class WindowInfo:
     title: str
     process_name: str
     exe_path: str = ""
+    hwnd: int = 0
+    pid: int = 0
 
     def key(self) -> tuple[str, str]:
         return (self.process_name.lower(), self.title)
@@ -645,7 +648,7 @@ def get_active_window() -> WindowInfo:
         except Exception:
             pass
 
-    return WindowInfo(title=title, process_name=process_name, exe_path=exe_path)
+    return WindowInfo(title=title, process_name=process_name, exe_path=exe_path, hwnd=hwnd, pid=pid)
 
 
 class ActivityTracker:
@@ -663,6 +666,8 @@ class ActivityTracker:
         self.keyboard_counter = PollingKeyboardTracker()
         self.tool_activity = ToolProcessActivityTracker()
         self.presence = Presence()
+        self.app_activity = AppActivity(storage.root, self.poll_interval)
+        self._last_app_activity_error = float('-inf')
         self._stop_event = threading.Event()
         # v2: process-level tracking state
         self._tool_sessions: dict[str, set[int]] = {}
@@ -675,6 +680,7 @@ class ActivityTracker:
 
     def run(self) -> None:
         active_window = get_active_window()
+        self._poll_app_activity(active_window)
         current = self._start_segment(active_window, now_local())
         last_seen_window_key = active_window.key()
         last_foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -712,6 +718,7 @@ class ActivityTracker:
                     self._peak_concurrency_at = None
 
                 active_window = get_active_window()
+                self._poll_app_activity(active_window)
                 active_key = active_window.key()
                 window_changed = active_key != last_seen_window_key
                 foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -790,6 +797,23 @@ class ActivityTracker:
                     last_state_write_ts = state_sample_ts
         finally:
             self._finish_segment(current, now_local())
+            try:
+                self.app_activity.flush(time.time())
+            except Exception as exc:
+                self._log_app_activity_error(exc)
+
+    def _poll_app_activity(self, window: WindowInfo) -> None:
+        try:
+            self.app_activity.poll(time.time(), window.hwnd, window.pid, window.process_name)
+        except Exception as exc:
+            self._log_app_activity_error(exc)
+
+    def _log_app_activity_error(self, exc: Exception) -> None:
+        now = time.monotonic()
+        if now - self._last_app_activity_error >= 60:
+            self._last_app_activity_error = now
+            warning = RuntimeError(f"App activity sidecar unavailable ({type(exc).__name__})")
+            append_exception_log(self.storage.root / "agent_error.log", warning)
 
     def _start_segment(self, window: WindowInfo, start_ts: datetime, is_away: bool = False) -> SegmentState:
         tags = ["away"] if is_away else self.rules.match(window)
